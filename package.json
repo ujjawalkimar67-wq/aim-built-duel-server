@@ -1,0 +1,12 @@
+{
+  "name": "aim-built-duel-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node duel-server.js",
+    "start:duel": "node duel-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
