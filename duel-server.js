@@ -8,14 +8,18 @@ const DUEL_WIN_SCORE = 10;
 const DUEL_COUNTDOWN_MS = 3200;
 const DUEL_RESPAWN_DELAY_MS = 1500;
 const DUEL_MAX_DAMAGE_PER_HIT = 250;
+const DUEL_SERVER_ID = process.env.DUEL_SERVER_ID || "A1";
+const DUEL_SERVER_REGION = process.env.DUEL_SERVER_REGION || "default";
+const rawDuelMaxPlayers = Number(process.env.DUEL_MAX_PLAYERS || 20);
+const DUEL_MAX_PLAYERS = Number.isFinite(rawDuelMaxPlayers) && rawDuelMaxPlayers > 0
+  ? Math.floor(rawDuelMaxPlayers)
+  : 20;
+const DUEL_BUILD_TAG = process.env.DUEL_BUILD_TAG || "local";
 const DUEL_TEST_SPAWNS = Object.freeze([
   Object.freeze({ x: -0.0, y: 0.0, z: 23.4, yaw: Math.PI }),
   Object.freeze({ x: -0.0, y: 0.0, z: -23.2, yaw: 0 })
 ]);
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("Aim Built Duel Server running\n");
-});
+const server = http.createServer(handleHttpRequest);
 const wss = new WebSocket.Server({ server });
 
 const duelQueue = [];
@@ -24,6 +28,102 @@ const playerToRoom = new Map();
 const playerToWaiting = new Set();
 const playerSockets = new Map();
 const playerNames = new Map();
+
+function writeCorsHeaders(res, extraHeaders = {}) {
+  res.writeHead(extraHeaders.statusCode || 200, {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    ...extraHeaders.headers
+  });
+}
+
+function sendJsonHttp(res, statusCode, payload) {
+  writeCorsHeaders(res, {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    }
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function pruneClosedPlayerSockets() {
+  for (const [playerId, ws] of playerSockets.entries()) {
+    if (!isOpen(ws)) {
+      playerSockets.delete(playerId);
+    }
+  }
+}
+
+function getDuelServerStatusSnapshot() {
+  cleanQueue();
+  pruneClosedPlayerSockets();
+
+  const roomCount = duelRooms.size;
+  const activePlayers = playerSockets.size;
+  const activeRoomPlayers = Array.from(duelRooms.values()).reduce(
+    (total, room) => total + (Array.isArray(room?.players) ? room.players.length : 0),
+    0
+  );
+  const waitingPlayers = duelQueue.length;
+  const maxPlayers = DUEL_MAX_PLAYERS;
+  const isFull = activePlayers >= maxPlayers;
+
+  return {
+    type: "duel_server_status",
+    serverId: DUEL_SERVER_ID,
+    region: DUEL_SERVER_REGION,
+    buildTag: DUEL_BUILD_TAG,
+    uptimeSec: Math.floor(process.uptime()),
+    timestamp: Date.now(),
+    activePlayers,
+    activeRoomPlayers,
+    roomCount,
+    waitingPlayers,
+    maxPlayers,
+    isFull,
+    canAccept: !isFull,
+    roomCapacityRemaining: Math.max(0, Math.floor((maxPlayers - activePlayers) / 2)),
+    playerCapacityRemaining: Math.max(0, maxPlayers - activePlayers)
+  };
+}
+
+function handleHttpRequest(req, res) {
+  if (req.method === "OPTIONS") {
+    writeCorsHeaders(res, { statusCode: 204 });
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (req.method === "GET" && url.pathname === "/duel_status") {
+    console.log("[DUEL SERVER STATUS] status endpoint hit", {
+      serverId: DUEL_SERVER_ID
+    });
+    sendJsonHttp(res, 200, getDuelServerStatusSnapshot());
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    sendJsonHttp(res, 200, {
+      ok: true,
+      serverId: DUEL_SERVER_ID,
+      uptimeSec: Math.floor(process.uptime()),
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  writeCorsHeaders(res, {
+    statusCode: 200,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8"
+    }
+  });
+  res.end(`Aim Built Duel Server ${DUEL_SERVER_ID} running\n`);
+}
 
 function isOpen(ws) {
   return ws && ws.readyState === WebSocket.OPEN;
@@ -365,8 +465,28 @@ function cleanupPlayer(playerId, reason = "left") {
 
 function handleDuelFind(ws, msg) {
   const playerId = getPlayerId(ws, msg);
-  playerSockets.set(playerId, ws);
   recordDuelPlayerName(playerId, msg.name);
+
+  const existingSocket = playerSockets.get(playerId);
+  const isExistingOpenPlayer = existingSocket && isOpen(existingSocket);
+  const statusBeforeFind = getDuelServerStatusSnapshot();
+  if (!isExistingOpenPlayer && statusBeforeFind.activePlayers >= DUEL_MAX_PLAYERS) {
+    console.log("[DUEL SERVER STATUS] server full reject", {
+      serverId: DUEL_SERVER_ID,
+      playerId,
+      activePlayers: statusBeforeFind.activePlayers,
+      maxPlayers: DUEL_MAX_PLAYERS
+    });
+    sendJson(ws, {
+      type: "duel_error",
+      reason: "server_full",
+      serverId: DUEL_SERVER_ID,
+      status: statusBeforeFind
+    });
+    return;
+  }
+
+  playerSockets.set(playerId, ws);
 
   console.log("[DUEL SERVER] duel_find", { playerId });
 
@@ -1069,16 +1189,29 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "duel_server_status") {
+      sendJson(ws, getDuelServerStatusSnapshot());
+      return;
+    }
+
     if (msg.type === "duel_debug_state") {
       const playerId = getPlayerId(ws, msg);
       const roomId = playerToRoom.get(playerId) || null;
       const room = roomId ? duelRooms.get(roomId) : null;
       const damageLockInfo = getDuelDamageLockInfo(room);
+      const serverStatus = getDuelServerStatusSnapshot();
       sendJson(ws, {
         type: "duel_debug_state_result",
+        serverId: DUEL_SERVER_ID,
+        serverStatus,
         playerId,
         queueLength: duelQueue.length,
-        roomCount: duelRooms.size,
+        activePlayers: serverStatus.activePlayers,
+        roomCount: serverStatus.roomCount,
+        waitingPlayers: serverStatus.waitingPlayers,
+        maxPlayers: serverStatus.maxPlayers,
+        isFull: serverStatus.isFull,
+        canAccept: serverStatus.canAccept,
         isWaiting: playerToWaiting.has(playerId),
         roomId,
         playerToRoomEntry: playerToRoom.get(playerId) || null,
