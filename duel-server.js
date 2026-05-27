@@ -180,6 +180,9 @@ function armDuelCountdown(room, reason = "match_start") {
   if (!room) {
     return null;
   }
+  if (reason !== "match_start" && reason !== "rematch_restart") {
+    return null;
+  }
 
   if (room.countdownClearTimeoutId) {
     clearTimeout(room.countdownClearTimeoutId);
@@ -618,7 +621,10 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
     liveRoom.roundVersion += 1;
     liveRoom.roundLocked = false;
     liveRoom.processedHitIds.clear();
-    const countdownPayload = armDuelCountdown(liveRoom, "round_reset");
+    console.log("[DUEL COUNTDOWN] no countdown after round reset", {
+      roomId: liveRoom.roomId,
+      roundVersion: liveRoom.roundVersion
+    });
 
     console.log("[DUEL SERVER] duel round reset", {
       roomId: liveRoom.roomId,
@@ -639,7 +645,6 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
       scoreBySpawnIndex: getScoreBySpawnIndex(liveRoom),
       timestamp: Date.now()
     });
-    broadcastDuelCountdownStart(liveRoom, countdownPayload);
   }, DUEL_RESPAWN_DELAY_MS);
 }
 
@@ -1101,6 +1106,7 @@ wss.on("connection", (ws) => {
         damageLocked: damageLockInfo.locked,
         damageLockReason: damageLockInfo.reason,
         DUEL_COUNTDOWN_MS,
+        countdownStartOnlyMode: true,
         rematchPending: room ? Boolean(room.rematchPending) : null,
         rematchRequesterId: room ? room.rematchRequesterId : null,
         rematchRequesterName: room ? room.rematchRequesterName : null,
