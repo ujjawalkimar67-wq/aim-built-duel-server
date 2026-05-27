@@ -22,6 +22,7 @@ const duelRooms = new Map();
 const playerToRoom = new Map();
 const playerToWaiting = new Set();
 const playerSockets = new Map();
+const playerNames = new Map();
 
 function isOpen(ws) {
   return ws && ws.readyState === WebSocket.OPEN;
@@ -48,6 +49,23 @@ function getPlayerId(ws, msg = {}) {
   const supplied = msg && msg.playerId ? String(msg.playerId).trim() : "";
   ws.duelPlayerId = supplied || `duel_conn_${Math.random().toString(36).slice(2, 10)}`;
   return ws.duelPlayerId;
+}
+
+function normalizeDuelPlayerName(value) {
+  const name = String(value || "").trim().replace(/\s+/g, " ");
+  return name ? name.slice(0, 24) : "";
+}
+
+function recordDuelPlayerName(playerId, value) {
+  const name = normalizeDuelPlayerName(value);
+  if (playerId && name) {
+    playerNames.set(playerId, name);
+  }
+  return name;
+}
+
+function getDuelPlayerName(playerId) {
+  return normalizeDuelPlayerName(playerNames.get(playerId));
 }
 
 function cleanQueue() {
@@ -174,6 +192,7 @@ function leaveDuelSession(playerId, reason = "leave") {
 
   const roomId = playerToRoom.get(playerId);
   if (!roomId) {
+    playerNames.delete(playerId);
     return wasQueued;
   }
 
@@ -192,6 +211,7 @@ function leaveDuelSession(playerId, reason = "leave") {
         type: "duel_opponent_left",
         roomId,
         playerId,
+        playerName: getDuelPlayerName(playerId),
         reason,
         timestamp: Date.now()
       });
@@ -212,6 +232,7 @@ function leaveDuelSession(playerId, reason = "leave") {
     });
   }
 
+  playerNames.delete(playerId);
   console.log("[DUEL SERVER] cleanup", { playerId, roomId, reason });
   return true;
 }
@@ -223,6 +244,7 @@ function cleanupPlayer(playerId, reason = "left") {
 function handleDuelFind(ws, msg) {
   const playerId = getPlayerId(ws, msg);
   playerSockets.set(playerId, ws);
+  recordDuelPlayerName(playerId, msg.name);
 
   console.log("[DUEL SERVER] duel_find", { playerId });
 
@@ -275,6 +297,9 @@ function handleDuelFind(ws, msg) {
     roundLocked: false,
     matchLocked: false,
     matchOver: false,
+    rematchPending: false,
+    rematchRequesterId: null,
+    rematchRequesterName: "",
     winnerTeam: null,
     loserTeam: null,
     winnerPlayerId: null,
@@ -398,6 +423,9 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
     room.matchLocked = true;
     room.matchOver = true;
     room.roundLocked = true;
+    room.rematchPending = false;
+    room.rematchRequesterId = null;
+    room.rematchRequesterName = "";
     room.winnerTeam = scorerTeam;
     room.loserTeam = loserTeam;
     room.winnerPlayerId = attackerId;
@@ -486,22 +514,7 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
   }, DUEL_RESPAWN_DELAY_MS);
 }
 
-function handleDuelRematch(ws, msg) {
-  const playerId = getPlayerId(ws, msg);
-  playerSockets.set(playerId, ws);
-
-  const roomId = playerToRoom.get(playerId);
-  const room = roomId ? duelRooms.get(roomId) : null;
-  if (!room) {
-    sendJson(ws, { type: "duel_error", reason: "not_in_duel" });
-    return;
-  }
-
-  if (msg.roomId && msg.roomId !== roomId) {
-    sendJson(ws, { type: "duel_error", reason: "wrong_room" });
-    return;
-  }
-
+function restartDuelMatch(room, reason = "accepted") {
   if (room.roundResetTimeoutId) {
     clearTimeout(room.roundResetTimeoutId);
     room.roundResetTimeoutId = 0;
@@ -512,6 +525,9 @@ function handleDuelRematch(ws, msg) {
   room.roundLocked = false;
   room.matchLocked = false;
   room.matchOver = false;
+  room.rematchPending = false;
+  room.rematchRequesterId = null;
+  room.rematchRequesterName = "";
   room.winnerTeam = null;
   room.loserTeam = null;
   room.winnerPlayerId = null;
@@ -536,7 +552,7 @@ function handleDuelRematch(ws, msg) {
 
   const payload = {
     type: "duel_match_restart",
-    roomId,
+    roomId: room.roomId,
     roundVersion: room.roundVersion,
     matchVersion: room.matchVersion,
     scoreByTeam: getScoreByTeam(room),
@@ -552,14 +568,83 @@ function handleDuelRematch(ws, msg) {
   };
 
   console.log("[DUEL MATCH END] match restart requested", {
-    roomId,
-    playerId,
-    reason: msg.reason || "button",
+    roomId: room.roomId,
+    reason,
     roundVersion: room.roundVersion,
     matchVersion: room.matchVersion
   });
 
   broadcastToDuelRoom(room, payload);
+}
+
+function resolveDuelRoomForMessage(ws, msg) {
+  const playerId = getPlayerId(ws, msg);
+  playerSockets.set(playerId, ws);
+  recordDuelPlayerName(playerId, msg.name);
+
+  const roomId = playerToRoom.get(playerId);
+  const room = roomId ? duelRooms.get(roomId) : null;
+  if (!room) {
+    sendJson(ws, { type: "duel_error", reason: "not_in_duel" });
+    return null;
+  }
+
+  if (msg.roomId && msg.roomId !== roomId) {
+    sendJson(ws, { type: "duel_error", reason: "wrong_room" });
+    return null;
+  }
+
+  return { playerId, roomId, room };
+}
+
+function broadcastDuelRematchRequestState(room) {
+  broadcastToDuelRoom(room, {
+    type: "duel_rematch_request_state",
+    roomId: room.roomId,
+    requesterId: room.rematchRequesterId,
+    requesterName: room.rematchRequesterName || getDuelPlayerName(room.rematchRequesterId),
+    pending: Boolean(room.rematchPending),
+    timestamp: Date.now()
+  });
+}
+
+function handleDuelRematchRequest(ws, msg, { acceptOnly = false } = {}) {
+  const resolved = resolveDuelRoomForMessage(ws, msg);
+  if (!resolved) {
+    return;
+  }
+
+  const { playerId, room } = resolved;
+  if (!room.matchLocked && !room.matchOver) {
+    return;
+  }
+
+  if (room.rematchPending && room.rematchRequesterId && room.rematchRequesterId !== playerId) {
+    console.log("[DUEL MATCH END] rematch accepted", {
+      roomId: room.roomId,
+      requesterId: room.rematchRequesterId,
+      accepterId: playerId
+    });
+    restartDuelMatch(room, "rematch accepted");
+    return;
+  }
+
+  if (acceptOnly) {
+    return;
+  }
+
+  if (!room.rematchPending) {
+    room.rematchPending = true;
+    room.rematchRequesterId = playerId;
+    room.rematchRequesterName = getDuelPlayerName(playerId);
+    console.log("[DUEL MATCH END] rematch request received", {
+      roomId: room.roomId,
+      requesterId: playerId,
+      requesterName: room.rematchRequesterName
+    });
+  }
+
+  broadcastDuelRematchRequestState(room);
 }
 
 function handleDuelHit(ws, msg) {
@@ -679,6 +764,7 @@ function relayDuelShot(ws, msg) {
 function routePlayerState(ws, msg) {
   const playerId = getPlayerId(ws, msg);
   playerSockets.set(playerId, ws);
+  recordDuelPlayerName(playerId, msg.name || msg.state?.name);
 
   const roomId = playerToRoom.get(playerId);
   if (!roomId) {
@@ -766,8 +852,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.type === "duel_rematch") {
-      handleDuelRematch(ws, msg);
+    if (msg.type === "duel_rematch" || msg.type === "duel_rematch_request") {
+      handleDuelRematchRequest(ws, msg);
+      return;
+    }
+
+    if (msg.type === "duel_rematch_accept") {
+      handleDuelRematchRequest(ws, msg, { acceptOnly: true });
       return;
     }
 
@@ -805,6 +896,9 @@ wss.on("connection", (ws) => {
         roundLocked: room ? room.roundLocked : null,
         matchLocked: room ? room.matchLocked : null,
         matchOver: room ? room.matchOver : null,
+        rematchPending: room ? Boolean(room.rematchPending) : null,
+        rematchRequesterId: room ? room.rematchRequesterId : null,
+        rematchRequesterName: room ? room.rematchRequesterName : null,
         winnerTeam: room ? room.winnerTeam : null,
         loserTeam: room ? room.loserTeam : null,
         winnerPlayerId: room ? room.winnerPlayerId : null,
