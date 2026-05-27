@@ -5,6 +5,7 @@ const PORT = process.env.PORT || 8766;
 const DUEL_MAP_ID = "oneVOneDuel";
 const DUEL_MAX_HP = 100;
 const DUEL_WIN_SCORE = 10;
+const DUEL_COUNTDOWN_MS = 3200;
 const DUEL_RESPAWN_DELAY_MS = 1500;
 const DUEL_MAX_DAMAGE_PER_HIT = 250;
 const DUEL_TEST_SPAWNS = Object.freeze([
@@ -160,6 +161,123 @@ function getScoreBySpawnIndex(room) {
   };
 }
 
+function clearDuelCountdown(room) {
+  if (!room) {
+    return;
+  }
+
+  if (room.countdownClearTimeoutId) {
+    clearTimeout(room.countdownClearTimeoutId);
+    room.countdownClearTimeoutId = 0;
+  }
+
+  room.countdownActive = false;
+  room.countdownPending = false;
+  room.countdownEndsAt = 0;
+}
+
+function armDuelCountdown(room, reason = "match_start") {
+  if (!room) {
+    return null;
+  }
+
+  if (room.countdownClearTimeoutId) {
+    clearTimeout(room.countdownClearTimeoutId);
+    room.countdownClearTimeoutId = 0;
+  }
+
+  const startsAt = Date.now();
+  const endsAt = startsAt + DUEL_COUNTDOWN_MS;
+  room.countdownActive = true;
+  room.countdownPending = false;
+  room.countdownStartsAt = startsAt;
+  room.countdownEndsAt = endsAt;
+  room.countdownVersion = (Number(room.countdownVersion) || 0) + 1;
+
+  const countdownVersion = room.countdownVersion;
+  room.countdownClearTimeoutId = setTimeout(() => {
+    const liveRoom = duelRooms.get(room.roomId);
+    if (!liveRoom || liveRoom.countdownVersion !== countdownVersion) {
+      return;
+    }
+
+    liveRoom.countdownActive = false;
+    liveRoom.countdownClearTimeoutId = 0;
+  }, DUEL_COUNTDOWN_MS + 80);
+
+  console.log(`[DUEL COUNTDOWN] start ${reason}`, {
+    roomId: room.roomId,
+    countdownVersion,
+    startsAt,
+    endsAt
+  });
+
+  return {
+    type: "duel_countdown_start",
+    roomId: room.roomId,
+    countdownVersion,
+    durationMs: DUEL_COUNTDOWN_MS,
+    startsAt,
+    endsAt,
+    reason
+  };
+}
+
+function broadcastDuelCountdownStart(room, payload) {
+  if (!room || !payload) {
+    return;
+  }
+
+  broadcastToDuelRoom(room, {
+    ...payload,
+    timestamp: Date.now()
+  });
+}
+
+function startDuelCountdown(room, reason = "match_start") {
+  const payload = armDuelCountdown(room, reason);
+  broadcastDuelCountdownStart(room, payload);
+  return payload;
+}
+
+function getDuelDamageLockInfo(room) {
+  if (!room) {
+    return { locked: true, reason: "no_room" };
+  }
+
+  if (room.matchLocked || room.matchOver) {
+    return { locked: true, reason: "match_locked" };
+  }
+
+  if (room.roundLocked) {
+    return { locked: true, reason: "round_locked" };
+  }
+
+  const now = Date.now();
+  if (room.countdownActive) {
+    const countdownEndsAt = Number(room.countdownEndsAt) || 0;
+    if (countdownEndsAt > now) {
+      return { locked: true, reason: "countdown", countdownEndsAt };
+    }
+
+    room.countdownActive = false;
+    if (room.countdownClearTimeoutId) {
+      clearTimeout(room.countdownClearTimeoutId);
+      room.countdownClearTimeoutId = 0;
+    }
+  }
+
+  if (room.countdownPending) {
+    return {
+      locked: true,
+      reason: "countdown",
+      countdownEndsAt: Number(room.countdownEndsAt) || 0
+    };
+  }
+
+  return { locked: false, reason: "" };
+}
+
 function broadcastToDuelRoom(room, payload) {
   if (!room?.players?.length) {
     return;
@@ -202,6 +320,7 @@ function leaveDuelSession(playerId, reason = "leave") {
       clearTimeout(room.roundResetTimeoutId);
       room.roundResetTimeoutId = 0;
     }
+    clearDuelCountdown(room);
 
     const opponentId = getOpponent(room, playerId);
     const opponentWs = opponentId ? playerSockets.get(opponentId) : null;
@@ -297,6 +416,14 @@ function handleDuelFind(ws, msg) {
     roundLocked: false,
     matchLocked: false,
     matchOver: false,
+    countdownActive: false,
+    countdownPending: true,
+    countdownStartsAt: 0,
+    countdownEndsAt: 0,
+    countdownVersion: 0,
+    countdownClearTimeoutId: 0,
+    countdownReadyByPlayerId: new Set(),
+    lastCountdownHitRejectLogAt: 0,
     rematchPending: false,
     rematchRequesterId: null,
     rematchRequesterName: "",
@@ -491,6 +618,7 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
     liveRoom.roundVersion += 1;
     liveRoom.roundLocked = false;
     liveRoom.processedHitIds.clear();
+    const countdownPayload = armDuelCountdown(liveRoom, "round_reset");
 
     console.log("[DUEL SERVER] duel round reset", {
       roomId: liveRoom.roomId,
@@ -511,6 +639,7 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
       scoreBySpawnIndex: getScoreBySpawnIndex(liveRoom),
       timestamp: Date.now()
     });
+    broadcastDuelCountdownStart(liveRoom, countdownPayload);
   }, DUEL_RESPAWN_DELAY_MS);
 }
 
@@ -549,6 +678,7 @@ function restartDuelMatch(room, reason = "accepted") {
   } else {
     room.processedHitIds = new Set();
   }
+  const countdownPayload = armDuelCountdown(room, "rematch_restart");
 
   const payload = {
     type: "duel_match_restart",
@@ -575,6 +705,7 @@ function restartDuelMatch(room, reason = "accepted") {
   });
 
   broadcastToDuelRoom(room, payload);
+  broadcastDuelCountdownStart(room, countdownPayload);
 }
 
 function resolveDuelRoomForMessage(ws, msg) {
@@ -647,6 +778,44 @@ function handleDuelRematchRequest(ws, msg, { acceptOnly = false } = {}) {
   broadcastDuelRematchRequestState(room);
 }
 
+function handleDuelCountdownReady(ws, msg) {
+  const resolved = resolveDuelRoomForMessage(ws, msg);
+  if (!resolved) {
+    return;
+  }
+
+  const { playerId, room } = resolved;
+  if (room.matchLocked || room.matchOver) {
+    return;
+  }
+
+  if (room.countdownActive) {
+    sendJson(ws, {
+      type: "duel_countdown_start",
+      roomId: room.roomId,
+      countdownVersion: room.countdownVersion || 0,
+      durationMs: Math.max(0, (Number(room.countdownEndsAt) || 0) - Date.now()),
+      startsAt: room.countdownStartsAt || Date.now(),
+      endsAt: room.countdownEndsAt || 0,
+      reason: "match_start",
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  room.countdownReadyByPlayerId = room.countdownReadyByPlayerId instanceof Set
+    ? room.countdownReadyByPlayerId
+    : new Set();
+  room.countdownReadyByPlayerId.add(playerId);
+
+  if (
+    room.countdownPending &&
+    room.players.every((pid) => room.countdownReadyByPlayerId.has(pid))
+  ) {
+    startDuelCountdown(room, "match_start");
+  }
+}
+
 function handleDuelHit(ws, msg) {
   const attackerId = getPlayerId(ws, msg);
   playerSockets.set(attackerId, ws);
@@ -663,7 +832,30 @@ function handleDuelHit(ws, msg) {
     return;
   }
 
-  if (room.roundLocked || room.matchLocked || room.matchOver) {
+  const lockInfo = getDuelDamageLockInfo(room);
+  if (lockInfo.locked) {
+    const now = Date.now();
+    if (
+      lockInfo.reason === "countdown" &&
+      now - (Number(room.lastCountdownHitRejectLogAt) || 0) > 1000
+    ) {
+      room.lastCountdownHitRejectLogAt = now;
+      console.log("[DUEL COUNTDOWN] hit blocked during countdown", {
+        roomId,
+        attackerId,
+        countdownEndsAt: room.countdownEndsAt,
+        countdownVersion: room.countdownVersion
+      });
+    }
+    sendJson(ws, {
+      type: "duel_hit_rejected",
+      roomId: room.roomId,
+      reason: "countdown_or_locked",
+      lockReason: lockInfo.reason,
+      countdownEndsAt: room.countdownEndsAt || 0,
+      countdownVersion: room.countdownVersion || 0,
+      timestamp: Date.now()
+    });
     return;
   }
 
@@ -862,6 +1054,11 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "duel_countdown_ready") {
+      handleDuelCountdownReady(ws, msg);
+      return;
+    }
+
     if (msg.type === "duel_shot") {
       relayDuelShot(ws, msg);
       return;
@@ -871,6 +1068,7 @@ wss.on("connection", (ws) => {
       const playerId = getPlayerId(ws, msg);
       const roomId = playerToRoom.get(playerId) || null;
       const room = roomId ? duelRooms.get(roomId) : null;
+      const damageLockInfo = getDuelDamageLockInfo(room);
       sendJson(ws, {
         type: "duel_debug_state_result",
         playerId,
@@ -896,6 +1094,13 @@ wss.on("connection", (ws) => {
         roundLocked: room ? room.roundLocked : null,
         matchLocked: room ? room.matchLocked : null,
         matchOver: room ? room.matchOver : null,
+        countdownActive: room ? Boolean(room.countdownActive) : null,
+        countdownPending: room ? Boolean(room.countdownPending) : null,
+        countdownEndsAt: room ? room.countdownEndsAt || 0 : null,
+        countdownVersion: room ? room.countdownVersion || 0 : null,
+        damageLocked: damageLockInfo.locked,
+        damageLockReason: damageLockInfo.reason,
+        DUEL_COUNTDOWN_MS,
         rematchPending: room ? Boolean(room.rematchPending) : null,
         rematchRequesterId: room ? room.rematchRequesterId : null,
         rematchRequesterName: room ? room.rematchRequesterName : null,
