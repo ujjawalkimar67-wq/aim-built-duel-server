@@ -4,6 +4,7 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 8766;
 const DUEL_MAP_ID = "oneVOneDuel";
 const DUEL_MAX_HP = 100;
+const DUEL_WIN_SCORE = 10;
 const DUEL_RESPAWN_DELAY_MS = 1500;
 const DUEL_MAX_DAMAGE_PER_HIT = 250;
 const DUEL_TEST_SPAWNS = Object.freeze([
@@ -269,8 +270,15 @@ function handleDuelFind(ws, msg) {
     players: [opponent.playerId, playerId],
     createdAt: Date.now(),
     state: "active",
+    matchVersion: 1,
     roundVersion: 1,
     roundLocked: false,
+    matchLocked: false,
+    matchOver: false,
+    winnerTeam: null,
+    loserTeam: null,
+    winnerPlayerId: null,
+    loserPlayerId: null,
     healthByPlayerId: {
       [opponent.playerId]: DUEL_MAX_HP,
       [playerId]: DUEL_MAX_HP
@@ -306,6 +314,7 @@ function handleDuelFind(ws, msg) {
     localHp: DUEL_MAX_HP,
     opponentHp: DUEL_MAX_HP,
     maxHp: DUEL_MAX_HP,
+    winningScore: DUEL_WIN_SCORE,
     roundVersion: room.roundVersion,
     spawns: DUEL_TEST_SPAWNS.map((spawn) => ({ ...spawn })),
     spawnByPlayerId: buildSpawnByPlayerId(room),
@@ -324,6 +333,7 @@ function handleDuelFind(ws, msg) {
     localHp: DUEL_MAX_HP,
     opponentHp: DUEL_MAX_HP,
     maxHp: DUEL_MAX_HP,
+    winningScore: DUEL_WIN_SCORE,
     roundVersion: room.roundVersion,
     spawns: DUEL_TEST_SPAWNS.map((spawn) => ({ ...spawn })),
     spawnByPlayerId: buildSpawnByPlayerId(room),
@@ -341,7 +351,7 @@ function handleDuelFind(ws, msg) {
 }
 
 function handleDuelPlayerDown(room, attackerId, victimId) {
-  if (!room || room.roundLocked) {
+  if (!room || room.roundLocked || room.matchLocked || room.matchOver) {
     return;
   }
 
@@ -382,6 +392,45 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
     scoreBySpawnIndex,
     timestamp: Date.now()
   });
+
+  if (scoreByTeam[scorerTeam] >= DUEL_WIN_SCORE) {
+    const loserTeam = room.teamByPlayerId[victimId] || (scorerTeam === "blue" ? "orange" : "blue");
+    room.matchLocked = true;
+    room.matchOver = true;
+    room.roundLocked = true;
+    room.winnerTeam = scorerTeam;
+    room.loserTeam = loserTeam;
+    room.winnerPlayerId = attackerId;
+    room.loserPlayerId = victimId;
+
+    console.log("[DUEL MATCH END] match over", {
+      roomId: room.roomId,
+      roundVersion: room.roundVersion,
+      winnerTeam: room.winnerTeam,
+      loserTeam: room.loserTeam,
+      winnerPlayerId: room.winnerPlayerId,
+      loserPlayerId: room.loserPlayerId,
+      scoreByTeam
+    });
+
+    broadcastToDuelRoom(room, {
+      type: "duel_match_over",
+      roomId: room.roomId,
+      roundVersion: room.roundVersion,
+      matchVersion: room.matchVersion,
+      winnerTeam: room.winnerTeam,
+      loserTeam: room.loserTeam,
+      winnerPlayerId: room.winnerPlayerId,
+      loserPlayerId: room.loserPlayerId,
+      scoreByTeam,
+      teamByPlayerId: { ...room.teamByPlayerId },
+      scoreByPlayerId,
+      scoreBySpawnIndex,
+      winningScore: DUEL_WIN_SCORE,
+      timestamp: Date.now()
+    });
+    return;
+  }
 
   broadcastToDuelRoom(room, {
     type: "duel_player_down",
@@ -437,6 +486,82 @@ function handleDuelPlayerDown(room, attackerId, victimId) {
   }, DUEL_RESPAWN_DELAY_MS);
 }
 
+function handleDuelRematch(ws, msg) {
+  const playerId = getPlayerId(ws, msg);
+  playerSockets.set(playerId, ws);
+
+  const roomId = playerToRoom.get(playerId);
+  const room = roomId ? duelRooms.get(roomId) : null;
+  if (!room) {
+    sendJson(ws, { type: "duel_error", reason: "not_in_duel" });
+    return;
+  }
+
+  if (msg.roomId && msg.roomId !== roomId) {
+    sendJson(ws, { type: "duel_error", reason: "wrong_room" });
+    return;
+  }
+
+  if (room.roundResetTimeoutId) {
+    clearTimeout(room.roundResetTimeoutId);
+    room.roundResetTimeoutId = 0;
+  }
+
+  room.matchVersion = (Number(room.matchVersion) || 1) + 1;
+  room.roundVersion = (Number(room.roundVersion) || 1) + 1;
+  room.roundLocked = false;
+  room.matchLocked = false;
+  room.matchOver = false;
+  room.winnerTeam = null;
+  room.loserTeam = null;
+  room.winnerPlayerId = null;
+  room.loserPlayerId = null;
+  room.teamByPlayerId = buildTeamByPlayerId(room);
+  room.scoreByPlayerId = {};
+  room.scoreByTeam = { blue: 0, orange: 0 };
+  room.healthByPlayerId = {};
+  room.maxHpByPlayerId = {};
+
+  for (const pid of room.players) {
+    room.scoreByPlayerId[pid] = 0;
+    room.healthByPlayerId[pid] = DUEL_MAX_HP;
+    room.maxHpByPlayerId[pid] = DUEL_MAX_HP;
+  }
+
+  if (room.processedHitIds && typeof room.processedHitIds.clear === "function") {
+    room.processedHitIds.clear();
+  } else {
+    room.processedHitIds = new Set();
+  }
+
+  const payload = {
+    type: "duel_match_restart",
+    roomId,
+    roundVersion: room.roundVersion,
+    matchVersion: room.matchVersion,
+    scoreByTeam: getScoreByTeam(room),
+    teamByPlayerId: { ...room.teamByPlayerId },
+    hpByPlayerId: { ...room.healthByPlayerId },
+    maxHp: DUEL_MAX_HP,
+    spawns: DUEL_TEST_SPAWNS.map((spawn) => ({ ...spawn })),
+    spawnByPlayerId: buildSpawnByPlayerId(room),
+    scoreByPlayerId: { ...room.scoreByPlayerId },
+    scoreBySpawnIndex: getScoreBySpawnIndex(room),
+    winningScore: DUEL_WIN_SCORE,
+    timestamp: Date.now()
+  };
+
+  console.log("[DUEL MATCH END] match restart requested", {
+    roomId,
+    playerId,
+    reason: msg.reason || "button",
+    roundVersion: room.roundVersion,
+    matchVersion: room.matchVersion
+  });
+
+  broadcastToDuelRoom(room, payload);
+}
+
 function handleDuelHit(ws, msg) {
   const attackerId = getPlayerId(ws, msg);
   playerSockets.set(attackerId, ws);
@@ -453,7 +578,7 @@ function handleDuelHit(ws, msg) {
     return;
   }
 
-  if (room.roundLocked) {
+  if (room.roundLocked || room.matchLocked || room.matchOver) {
     return;
   }
 
@@ -641,6 +766,11 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "duel_rematch") {
+      handleDuelRematch(ws, msg);
+      return;
+    }
+
     if (msg.type === "duel_shot") {
       relayDuelShot(ws, msg);
       return;
@@ -665,11 +795,20 @@ wss.on("connection", (ws) => {
         scoreByPlayerId: room ? { ...room.scoreByPlayerId } : null,
         scoreByTeam: room ? getScoreByTeam(room) : null,
         scoreBySpawnIndex: room ? getScoreBySpawnIndex(room) : null,
+        DUEL_WIN_SCORE,
+        duelWinScore: DUEL_WIN_SCORE,
         spawns: room ? DUEL_TEST_SPAWNS.map((spawn) => ({ ...spawn })) : null,
         spawnByPlayerId: room ? buildSpawnByPlayerId(room) : null,
         teamByPlayerId: room ? { ...(room.teamByPlayerId || buildTeamByPlayerId(room)) } : null,
+        matchVersion: room ? room.matchVersion : null,
         roundVersion: room ? room.roundVersion : null,
-        roundLocked: room ? room.roundLocked : null
+        roundLocked: room ? room.roundLocked : null,
+        matchLocked: room ? room.matchLocked : null,
+        matchOver: room ? room.matchOver : null,
+        winnerTeam: room ? room.winnerTeam : null,
+        loserTeam: room ? room.loserTeam : null,
+        winnerPlayerId: room ? room.winnerPlayerId : null,
+        loserPlayerId: room ? room.loserPlayerId : null
       });
       return;
     }
